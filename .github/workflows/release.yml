@@ -1,0 +1,475 @@
+# =============================================================================
+# GitHub Actions Workflow - EverCore Release
+# Repository: everhytale/evercore
+# =============================================================================
+# Build and publish JAR to GitHub Packages
+#
+# Version Strategy (SemVer):
+#   - v1.0.0          → Stable release (GitHub Packages + GitHub Release)
+#   - v1.0.0-rc.1     → Release Candidate (GitHub Packages, prerelease)
+#   - v1.0.0-beta.1   → Beta (GitHub Packages, prerelease)
+#   - v1.0.0-alpha.1  → Alpha (GitHub Packages, prerelease)
+#   - v1.0.0-dev.1    → Development (GitHub Packages, prerelease)
+#   - main branch     → Edge/SNAPSHOT (GitHub Packages, no release)
+#
+# Usage:
+#   # Stable release
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+#   # Release candidate
+#   git tag v1.0.0-rc.1 && git push origin v1.0.0-rc.1
+#
+#   # Edge build (automatic on push to main)
+#
+# Security:
+#   - Only triggered on push (not PRs) - no PR access to secrets
+#   - Actions are pinned by SHA for supply chain security
+#   - Permissions are scoped per-job (least privilege)
+#   - Credentials are validated before use
+#   - Sensitive files are cleaned up immediately after use
+#
+# Requirements:
+#   - HYTALE_CREDENTIALS secret (JSON credentials for Hytale downloader)
+# =============================================================================
+
+name: EverCore - Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+    paths:
+      - 'src/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle/**'
+      - '.github/workflows/release.yml'
+
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: 'Version override (e.g., 1.0.0-custom.1)'
+        required: false
+        default: ''
+      skip_tests:
+        description: 'Skip tests'
+        required: false
+        default: 'false'
+
+# Default: read-only permissions
+permissions:
+  contents: read
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+
+jobs:
+  # ===========================================================================
+  # Job 1: Determine Version (read-only, no secrets needed)
+  # ===========================================================================
+  version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_type: ${{ steps.version.outputs.type }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      should_release: ${{ steps.version.outputs.should_release }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          REF="${GITHUB_REF}"
+          VERSION_OVERRIDE="${{ github.event.inputs.version_override }}"
+
+          # Priority: version override > tag > branch
+          if [[ -n "$VERSION_OVERRIDE" ]]; then
+            # Validate version format (basic sanitization)
+            if [[ ! "$VERSION_OVERRIDE" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+              echo "::error::Invalid version format: $VERSION_OVERRIDE"
+              exit 1
+            fi
+            VERSION="$VERSION_OVERRIDE"
+            echo "Using override version: $VERSION"
+          elif [[ "$REF" == refs/tags/v* ]]; then
+            VERSION="${REF#refs/tags/v}"
+            echo "Using tag version: $VERSION"
+          else
+            # Edge build: use commit SHA
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            BASE_VERSION=$(grep '^version' build.gradle.kts | sed 's/.*"\(.*\)".*/\1/' | head -1)
+            VERSION="${BASE_VERSION}-SNAPSHOT.${SHORT_SHA}"
+            echo "Using edge version: $VERSION"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Determine version type
+          if [[ "$VERSION" == *"-SNAPSHOT"* ]]; then
+            echo "type=edge" >> $GITHUB_OUTPUT
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION" == *"-rc."* ]]; then
+            echo "type=rc" >> $GITHUB_OUTPUT
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION" == *"-beta."* ]]; then
+            echo "type=beta" >> $GITHUB_OUTPUT
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION" == *"-alpha."* ]]; then
+            echo "type=alpha" >> $GITHUB_OUTPUT
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION" == *"-dev."* ]]; then
+            echo "type=dev" >> $GITHUB_OUTPUT
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "type=release" >> $GITHUB_OUTPUT
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Version: $VERSION"
+          echo "Type: $(grep type $GITHUB_OUTPUT | tail -1 | cut -d= -f2)"
+
+  # ===========================================================================
+  # Job 2: Build
+  # ===========================================================================
+  build:
+    name: Build
+    needs: version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # -----------------------------------------------------------------------
+      # Download HytaleServer.jar dependency
+      # -----------------------------------------------------------------------
+      - name: Download Hytale downloader
+        run: |
+          curl -fsSL https://downloader.hytale.com/hytale-downloader.zip -o hytale-downloader.zip
+          unzip -q hytale-downloader.zip -d hytale-downloader
+          chmod +x hytale-downloader/hytale-downloader-linux-amd64
+
+      - name: Create credentials file
+        env:
+          HYTALE_CREDENTIALS: ${{ secrets.HYTALE_CREDENTIALS }}
+        run: |
+          # Validate that credentials exist
+          if [ -z "$HYTALE_CREDENTIALS" ]; then
+            echo "::error::HYTALE_CREDENTIALS secret is not set"
+            exit 1
+          fi
+          printenv HYTALE_CREDENTIALS > .hytale-credentials.json
+
+      - name: Download Hytale game files
+        id: hytale
+        run: |
+          cp .hytale-credentials.json hytale-downloader/.hytale-downloader-credentials.json
+
+          # Get Hytale version
+          cd hytale-downloader
+          HYTALE_VERSION=$(timeout 30s ./hytale-downloader-linux-amd64 -print-version)
+
+          echo "hytale_version=$HYTALE_VERSION" >> $GITHUB_OUTPUT
+          echo "Hytale version: $HYTALE_VERSION"
+
+          # Download game files
+          ./hytale-downloader-linux-amd64 -download-path ../game.zip
+
+          cd ..
+          mkdir -p game-files
+          unzip -q game.zip -d game-files
+
+          # Extract HytaleServer.jar to libs folder
+          mkdir -p libs
+          cp game-files/Server/HytaleServer.jar libs/
+
+          # Cleanup sensitive files immediately
+          rm -f .hytale-credentials.json hytale-downloader/.hytale-downloader-credentials.json
+          rm -rf game-files game.zip hytale-downloader
+
+          echo "HytaleServer.jar downloaded successfully"
+          ls -la libs/
+
+      # -----------------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------------
+      - name: Set up JDK 25
+        uses: actions/setup-java@387ac29b308b003ca37ba93a6cab5eb57c8f5f93 # v4.0.0
+        with:
+          java-version: '25-ea'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Set version in build.gradle.kts
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" build.gradle.kts
+          echo "Updated version to: $VERSION"
+          grep "^version" build.gradle.kts
+
+      - name: Build with Gradle
+        run: ./gradlew build --no-daemon --warning-mode all
+
+      - name: Run tests
+        if: github.event.inputs.skip_tests != 'true'
+        run: ./gradlew test --no-daemon
+
+      - name: Generate Javadoc
+        run: ./gradlew javadoc --no-daemon
+        continue-on-error: true
+
+      - name: Upload JAR artifacts
+        uses: actions/upload-artifact@c7d193f32edcb7bfad88892161225aeda64e9392 # v4.0.0
+        with:
+          name: evercore-jars
+          path: build/libs/*.jar
+          retention-days: 30
+
+      - name: Upload Javadoc
+        uses: actions/upload-artifact@c7d193f32edcb7bfad88892161225aeda64e9392 # v4.0.0
+        if: success()
+        with:
+          name: javadoc
+          path: build/docs/javadoc/
+          retention-days: 30
+
+  # ===========================================================================
+  # Job 3: Publish to GitHub Packages
+  # ===========================================================================
+  publish:
+    name: Publish to GitHub Packages
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # -----------------------------------------------------------------------
+      # Download HytaleServer.jar dependency
+      # -----------------------------------------------------------------------
+      - name: Download Hytale downloader
+        run: |
+          curl -fsSL https://downloader.hytale.com/hytale-downloader.zip -o hytale-downloader.zip
+          unzip -q hytale-downloader.zip -d hytale-downloader
+          chmod +x hytale-downloader/hytale-downloader-linux-amd64
+
+      - name: Create credentials file
+        env:
+          HYTALE_CREDENTIALS: ${{ secrets.HYTALE_CREDENTIALS }}
+        run: |
+          if [ -z "$HYTALE_CREDENTIALS" ]; then
+            echo "::error::HYTALE_CREDENTIALS secret is not set"
+            exit 1
+          fi
+          printenv HYTALE_CREDENTIALS > .hytale-credentials.json
+
+      - name: Download Hytale game files
+        run: |
+          cp .hytale-credentials.json hytale-downloader/.hytale-downloader-credentials.json
+
+          cd hytale-downloader
+          ./hytale-downloader-linux-amd64 -download-path ../game.zip
+
+          cd ..
+          mkdir -p game-files
+          unzip -q game.zip -d game-files
+
+          # Extract HytaleServer.jar to libs folder
+          mkdir -p libs
+          cp game-files/Server/HytaleServer.jar libs/
+
+          # Cleanup sensitive files immediately
+          rm -f .hytale-credentials.json hytale-downloader/.hytale-downloader-credentials.json
+          rm -rf game-files game.zip hytale-downloader
+
+      # -----------------------------------------------------------------------
+      # Publish
+      # -----------------------------------------------------------------------
+      - name: Set up JDK 25
+        uses: actions/setup-java@387ac29b308b003ca37ba93a6cab5eb57c8f5f93 # v4.0.0
+        with:
+          java-version: '25-ea'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Set version in build.gradle.kts
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" build.gradle.kts
+
+      - name: Publish to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: ./gradlew publish --no-daemon
+
+      - name: Publish summary
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          TYPE="${{ needs.version.outputs.version_type }}"
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+
+          echo "## 📦 Published to GitHub Packages" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Group** | \`fr.everhytale\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Artifact** | \`evercore\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | \`$VERSION\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Type** | \`$TYPE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Maven Dependency" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```xml' >> $GITHUB_STEP_SUMMARY
+          echo "<dependency>" >> $GITHUB_STEP_SUMMARY
+          echo "    <groupId>fr.everhytale</groupId>" >> $GITHUB_STEP_SUMMARY
+          echo "    <artifactId>evercore</artifactId>" >> $GITHUB_STEP_SUMMARY
+          echo "    <version>$VERSION</version>" >> $GITHUB_STEP_SUMMARY
+          echo "</dependency>" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Gradle Dependency" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```kotlin' >> $GITHUB_STEP_SUMMARY
+          echo "implementation(\"fr.everhytale:evercore:$VERSION\")" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Repository Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```kotlin' >> $GITHUB_STEP_SUMMARY
+          echo "repositories {" >> $GITHUB_STEP_SUMMARY
+          echo "    maven {" >> $GITHUB_STEP_SUMMARY
+          echo "        url = uri(\"https://maven.pkg.github.com/$REPO\")" >> $GITHUB_STEP_SUMMARY
+          echo "        credentials {" >> $GITHUB_STEP_SUMMARY
+          echo "            username = project.findProperty(\"gpr.user\") as String? ?: System.getenv(\"GITHUB_ACTOR\")" >> $GITHUB_STEP_SUMMARY
+          echo "            password = project.findProperty(\"gpr.key\") as String? ?: System.getenv(\"GITHUB_TOKEN\")" >> $GITHUB_STEP_SUMMARY
+          echo "        }" >> $GITHUB_STEP_SUMMARY
+          echo "    }" >> $GITHUB_STEP_SUMMARY
+          echo "}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Job 4: Create GitHub Release
+  # ===========================================================================
+  release:
+    name: Create GitHub Release
+    needs: [version, build, publish]
+    runs-on: ubuntu-latest
+    if: needs.version.outputs.should_release == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: Download JAR artifacts
+        uses: actions/download-artifact@f44cd7b40bfd40b6aa1cc1b9b5b7bf03d3c67110 # v4.1.0
+        with:
+          name: evercore-jars
+          path: artifacts/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          TYPE="${{ needs.version.outputs.version_type }}"
+
+          # Get previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          echo "## What's Changed" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+
+          if [[ -n "$PREV_TAG" ]]; then
+            # List commits since previous tag
+            git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md
+          else
+            # First release
+            echo "Initial release of EverCore v${VERSION}" >> CHANGELOG.md
+          fi
+
+          echo "" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "---" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "### Installation" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo '```kotlin' >> CHANGELOG.md
+          echo "implementation(\"fr.everhytale:evercore:$VERSION\")" >> CHANGELOG.md
+          echo '```' >> CHANGELOG.md
+
+          # Add prerelease warning if applicable
+          if [[ "$TYPE" != "release" ]]; then
+            echo "" >> CHANGELOG.md
+            echo "> ⚠️ **This is a $TYPE version.** It may contain bugs or breaking changes." >> CHANGELOG.md
+          fi
+
+          cat CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v0.1.15
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: EverCore v${{ needs.version.outputs.version }}
+          body_path: CHANGELOG.md
+          prerelease: ${{ needs.version.outputs.is_prerelease }}
+          files: |
+            artifacts/*.jar
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release summary
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          TYPE="${{ needs.version.outputs.version_type }}"
+          IS_PRERELEASE="${{ needs.version.outputs.is_prerelease }}"
+
+          echo "## 🚀 GitHub Release Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | \`v$VERSION\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Type** | \`$TYPE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Pre-release** | \`$IS_PRERELEASE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Release Assets" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for jar in artifacts/*.jar; do
+            if [ -f "$jar" ]; then
+              SIZE=$(du -h "$jar" | cut -f1)
+              echo "- \`$(basename $jar)\` ($SIZE)" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View Release](https://github.com/${{ github.repository }}/releases/tag/v$VERSION)" >> $GITHUB_STEP_SUMMARY

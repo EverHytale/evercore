@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+bin/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# Local libs (downloaded at build time)
+libs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Hytale credentials (never commit)
+.hytale-credentials.json
+*.credentials.json
